@@ -6,12 +6,18 @@ import os
 import tempfile
 
 from src.services.chat_service import ChatService
-from src.core.storage.repository import load_documents, save_documents, load_history, save_history
+import src.core.storage.repository as repository
 from src.utils.document_parser import parse_document
+from src.core.llm.embedder import get_embedding
+from src.rag.text_splitter import chunk_text
+from src.utils.logger import get_logger # 👈 新增日志导入
 
+logger = get_logger("StreamlitUI") # 👈 初始化日志
 
 def render_ui():
     """渲染整个 UI 界面"""
+    
+    logger.info("====== 开始渲染 UI 界面 ======") # 👈 日志
     
     chat_service = ChatService()
     
@@ -20,9 +26,9 @@ def render_ui():
     
     # ====== 初始化 session_state ======
     if "documents" not in st.session_state:
-        st.session_state.documents = load_documents()
+        st.session_state.documents = repository.load_documents()
     if "history" not in st.session_state:
-        st.session_state.history = load_history()
+        st.session_state.history = repository.load_history()
     if "uploader_key" not in st.session_state:
         st.session_state.uploader_key = 0
     # 👇 加回监督者相关的 session_state
@@ -40,24 +46,62 @@ def render_ui():
     )
     
     if uploaded_files:
+        logger.info(f"检测到上传文件，共 {len(uploaded_files)} 个，开始处理...") # 👈 日志
         new_count = 0
+        #准备一个列表，存切分好的内容（带溯源信息）
+        new_chunks_with_source = []
         for file in uploaded_files:
             if any(doc["name"] == file.name for doc in st.session_state.documents):
+                logger.info(f"文件 {file.name} 已存在，跳过") # 👈 日志
                 continue
             
             with st.spinner(f"正在解析：{file.name}"):
-                content = parse_document(file.getbuffer(), filename=file.name)
+                content = parse_document(file.getvalue(), filename=file.name)
             
             if "出错" not in content and "不支持" not in content:
                 st.session_state.documents.append({
                     "name": file.name,
                     "content": content
                 })
-                save_documents(st.session_state.documents)
+                repository.save_documents(st.session_state.documents)
+                chunks = chunk_text(content)
+                for chunk in chunks:
+                    new_chunks_with_source.append({
+                        "source": file.name,
+                        "text": chunk
+                    })
                 new_count += 1
+                logger.info(f"文件 {file.name} 解析并切分成功，产生 {len(chunks)} 个文本块") # 👈 日志
+            else:
+                logger.warning(f"文件 {file.name} 解析失败或格式不支持") # 👈 日志
+
+        #提取切分好的文本
+        if new_chunks_with_source: # 👈 新增判空保护，防止无新文档时API报错
+            chunk_texts = [item["text"] for item in new_chunks_with_source]
+            logger.info(f"准备对 {len(chunk_texts)} 个文本块进行向量化") # 👈 日志
+            
+            #发给大模型并接收返回的向量数组
+            embeddings = get_embedding(chunk_texts)
+            
+            if embeddings is None: # 👈 新增API失败保护
+                logger.error("❌ 向量化失败，get_embedding 返回 None！请检查 Embedding API 配置")
+                st.error("❌ 致命错误：向量化 API 调用失败，请检查终端日志！")
+                st.stop()
+
+            #数据重组
+            final_data = []
+            for i, item in enumerate(new_chunks_with_source):
+                final_data.append({
+                    "source":item["source"],
+                    "text":item["text"],
+                    "embedding":embeddings[i] #向量 、文本、溯源对应
+                })
+            #持久化
+            repository.save_vectors(final_data)
+            logger.info(f"✅ 向量化并持久化成功，共保存 {len(final_data)} 条向量数据") # 👈 日志
         
         if new_count > 0:
-            st.success(f"✅ 成功加载 {new_count} 个文档，当前共 {len(st.session_state.documents)} 个文档")
+            st.success(f"✅ 成功加载 {new_count} 个文档，当前共 {len(st.session_state.documents)} 个文档,共切割{len(new_chunks_with_source)}块")
     
     # ====== 文档列表 ======
     if st.session_state.documents:
@@ -74,7 +118,7 @@ def render_ui():
                 keys_to_remove = [k for k in st.session_state.keys() if k.startswith(f"preview_state_{i}") or k.startswith(f"content_area_{i}")]
                 for k in keys_to_remove:
                     del st.session_state[k]
-                save_documents(st.session_state.documents)
+                repository.save_documents(st.session_state.documents)
                 st.session_state.uploader_key += 1
                 st.rerun()
             if st.session_state.get(f"preview_state_{i}", False):
@@ -91,7 +135,7 @@ def render_ui():
             keys_to_remove = [k for k in st.session_state.keys() if k.startswith("preview_state_") or k.startswith("content_area_")]
             for k in keys_to_remove:
                 del st.session_state[k]
-            save_documents(st.session_state.documents)
+            repository.save_documents(st.session_state.documents)
             st.session_state.uploader_key += 1
             st.rerun()
     
@@ -104,8 +148,12 @@ def render_ui():
         if not st.session_state.documents:
             st.warning("请先上传文档")
         else:
+            logger.info(f"====== 用户发起提问: {question} ======") # 👈 日志
             with st.spinner("AI 正在综合所有文档思考..."):
-                result = chat_service.ask(question, st.session_state.documents)
+                # 👇 核心修改：只传 question，后端自动检索
+                logger.info("开始调用 ChatService (LangGraph 图执行)") # 👈 日志
+                result = chat_service.ask(question)
+                logger.info("ChatService 图执行完毕，收到最终结果") # 👈 日志
                 
                 # 👇 更新监督者日志（从 result 中提取）
                 st.session_state.supervision_log = {
@@ -135,7 +183,7 @@ def render_ui():
                 if result.get("intervention_instruction"):
                     history_entry["intervention"] = result["intervention_instruction"]
                 st.session_state.history.append(history_entry)
-                save_history(st.session_state.history)
+                repository.save_history(st.session_state.history)
             
             st.write("🤖 回答：")
             st.write(result["answer"])
@@ -168,5 +216,5 @@ def render_ui():
             st.markdown("---")
         if st.button("🗑️ 清空历史", key="clear_history"):
             st.session_state.history = []
-            save_history(st.session_state.history)
+            repository.save_history(st.session_state.history)
             st.rerun()

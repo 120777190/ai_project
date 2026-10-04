@@ -3,18 +3,17 @@
 
 from src.core.agent.graph import get_agent_app
 
-
 class ChatService:
     """问答服务"""
     
     def __init__(self):
         self.agent_app = get_agent_app()
     
-    def ask(self, question: str, documents: list) -> dict:
-        """执行问答"""
+    def ask(self, question: str) -> dict:
+        """执行问答：参数全部走配置，调用方无需关心检索细节"""
         initial_state = {
             "question": question,
-            "documents": documents,
+            "documents": [],
             "first_answer": "",
             "final_answer": "",
             "extra_prompt": "",
